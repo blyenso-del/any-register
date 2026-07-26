@@ -1734,48 +1734,356 @@ return 'no-btn';
 })()""")
 
 
-def wait_for_sso(log=print, timeout=120) -> str:
+def discover_oidc_endpoints(log=print) -> dict:
+    """动态获取并校验 OIDC 配置 Endpoint (auth.x.ai)"""
+    import urllib.request
+    import json
+    disc_url = "https://auth.x.ai/.well-known/openid-configuration"
+    try:
+        req = urllib.request.Request(
+            disc_url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "grok-register-cpa/1.0",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            dev_ep = data.get("device_authorization_endpoint")
+            tok_ep = data.get("token_endpoint")
+            if dev_ep and tok_ep:
+                log(f"[*] OIDC 服务发现成功: device_ep={dev_ep}, token_ep={tok_ep}")
+                return {"device_authorization_endpoint": dev_ep, "token_endpoint": tok_ep}
+    except Exception as e:
+        log(f"[!] OIDC 服务发现异常 ({e})，将降级使用静态 Endpoint")
+    return {
+        "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
+        "token_endpoint": "https://auth.x.ai/oauth2/token",
+    }
+
+
+def request_device_code(device_endpoint: str = None) -> dict:
+    import urllib.request
+    import urllib.parse
+    import json
+    url = device_endpoint or "https://auth.x.ai/oauth2/device/code"
+    payload = urllib.parse.urlencode({
+        "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+        "scope": "openid profile email offline_access grok-cli:access api:access",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "grok-register-cpa/1.0",
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def poll_device_token(device_code: str, interval: int = 5, timeout: int = 120, token_endpoint: str = None, log=print) -> dict:
+    import urllib.request
+    import urllib.parse
+    import json
+    url = token_endpoint or "https://auth.x.ai/oauth2/token"
     deadline = time.time() + timeout
-    last_submit_retry = 0.0
-    last_cf_retry = 0.0
+    payload = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code.strip(),
+        "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+    }).encode("utf-8")
+
+    curr_interval = interval
+    net_streak = 0
 
     while time.time() < deadline:
-        url = get_current_url()
+        try:
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "User-Agent": "grok-register-cpa/1.0",
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if "access_token" in data:
+                    return data
+        except urllib.error.HTTPError as e:
+            net_streak = 0
+            try:
+                err_body = json.loads(e.read().decode("utf-8"))
+                err = err_body.get("error", "")
+                if err == "authorization_pending":
+                    time.sleep(curr_interval)
+                    continue
+                elif err == "slow_down":
+                    curr_interval = min(curr_interval + 5, 30)
+                    log(f"[*] 触发 slow_down 调整轮询间隔为 {curr_interval}s")
+                    time.sleep(curr_interval)
+                    continue
+                elif err in ("expired_token", "access_denied"):
+                    log(f"[!] 设备码已失效或拒绝授权: {err}")
+                    return {}
+            except Exception:
+                pass
+            time.sleep(curr_interval)
+        except Exception as e:
+            net_streak += 1
+            if net_streak <= 20:
+                time.sleep(curr_interval)
+            else:
+                log(f"[!] 轮询遭遇持续网络故障: {e}")
+                break
 
-        if "grok.com" in url:
-            sso = _try_document_cookie_sso()
-            if sso:
-                log(f"[*] 已获取 sso (document.cookie, 长度={len(sso)})")
-                return sso
-            sso = _try_storage_sso()
-            if sso:
-                log(f"[*] 已获取 sso (storage, 长度={len(sso)})")
-                return sso
-            sso = _try_auth_fetch_sso()
-            if sso:
-                log(f"[*] 已获取 sso (auth fetch, 长度={len(sso)})")
-                return sso
-            log("[Debug] 已在 grok.com 但暂未提取到 sso，继续尝试...")
-            time.sleep(2)
+    return {}
+
+
+def save_cpa_json_credential(token_result: dict, token_endpoint: str = None, auth_dir: str = "cpa_auths", hotload_dir: str = None, log=print) -> str:
+    """提取 Token、解析 JWT 生成标准 CPA xAI JSON 并落盘与支持热加载保存"""
+    import base64
+    import json
+    from datetime import datetime, timezone
+
+    access_token = token_result.get("access_token", "")
+    refresh_token = token_result.get("refresh_token", "")
+    id_token = token_result.get("id_token", "")
+
+    if not access_token:
+        return ""
+
+    email = ""
+    sub = ""
+
+    # 解析 JWT (优先从 id_token 提，其次从 access_token)
+    for jwt in (id_token, access_token):
+        if not jwt or jwt.count(".") < 2:
             continue
+        try:
+            part = jwt.split(".")[1]
+            rem = len(part) % 4
+            if rem > 0:
+                part += "=" * (4 - rem)
+            decoded = json.loads(base64.urlsafe_b64decode(part).decode("utf-8"))
+            email = email or decoded.get("email", "")
+            sub = sub or decoded.get("sub", "")
+            if email and sub:
+                break
+        except Exception:
+            pass
 
-        now = time.time()
-        if now - last_submit_retry >= 2.5:
-            _retry_submit_on_final_page(log)
-            last_submit_retry = now
-            if now - last_cf_retry >= 10:
-                try:
-                    _kick_turnstile(log=log)
-                    token = get_turnstile_token(timeout=5, log=log)
-                    if token:
-                        _sync_turnstile_token(token)
-                except Exception:
-                    pass
-                last_cf_retry = now
+    now = datetime.now(timezone.utc)
+    expires_in = token_result.get("expires_in", 21600)
+    exp_time = datetime.fromtimestamp(now.timestamp() + expires_in, tz=timezone.utc)
 
+    cpa_payload = {
+        "type": "xai",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": token_result.get("token_type", "Bearer"),
+        "expires_in": expires_in,
+        "expired": exp_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "email": email,
+        "sub": sub,
+        "base_url": "https://cli-chat-proxy.grok.com/v1",
+        "redirect_uri": "http://127.0.0.1:56121/callback",
+        "token_endpoint": token_endpoint or "https://auth.x.ai/oauth2/token",
+        "auth_kind": "oauth"
+    }
+
+    # 原子落盘
+    os.makedirs(auth_dir, exist_ok=True)
+    filename = f"xai-{email or sub or 'token'}.json"
+    file_path = os.path.join(auth_dir, filename)
+
+    try:
+        temp_path = file_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(cpa_payload, f, indent=2, ensure_ascii=False)
+        try:
+            os.chmod(temp_path, 0o600)
+        except Exception:
+            pass
+        os.replace(temp_path, file_path)
+        log(f"[*] CPA 凭证成功保存至: {file_path}")
+
+        # 若配置了热加载目录，同步复制
+        if hotload_dir:
+            os.makedirs(hotload_dir, exist_ok=True)
+            hot_path = os.path.join(hotload_dir, filename)
+            shutil.copy2(file_path, hot_path)
+            log(f"[*] CPA 凭证成功热加载至: {hot_path}")
+
+        return file_path
+    except Exception as e:
+        log(f"[!] 保存 CPA 凭证失败: {e}")
+        return ""
+
+
+def authorize_grok_build(log=print, timeout=120) -> str:
+    log("[*] 1. 动态获取 OIDC Endpoint 配置...")
+    endpoints = discover_oidc_endpoints(log=log)
+    device_ep = endpoints.get("device_authorization_endpoint")
+    token_ep = endpoints.get("token_endpoint")
+
+    log("[*] 等待资料提交后登录跳转完成 (到达 grok.com)...")
+    wait_deadline = time.time() + 30
+    while time.time() < wait_deadline:
+        curr = get_current_url()
+        if "grok.com" in curr:
+            log("[*] 登录跳转完成，当前处于 grok.com")
+            break
         time.sleep(1)
+    else:
+        log("[!] 提示：未在 30 秒内检测到跳转至 grok.com，直接尝试授权导航...")
 
-    raise Exception("等待超时：未获取到 sso cookie")
+    log("[*] 2. 授权前导航访问 post-inject session URL: https://accounts.x.ai/account...")
+    try:
+        run("open", "https://accounts.x.ai/account", "--window", "foreground", timeout=30)
+        wait_doc_loaded(timeout=10)
+        time.sleep(3.0)
+    except Exception as e:
+        log(f"[!] 导航至 accounts.x.ai/account 出现提示/警告: {e}")
+
+    log("[*] 3. 向 auth.x.ai 申请 Device Code...")
+    dev_info = request_device_code(device_endpoint=device_ep)
+    device_code = dev_info.get("device_code", "")
+    user_code = dev_info.get("user_code", "")
+    complete_url = dev_info.get("verification_uri_complete", "") or f"https://accounts.x.ai/oauth2/device?user_code={user_code}"
+    interval = int(dev_info.get("interval", 5))
+
+    if not device_code or not complete_url:
+        raise Exception("获取 Device Code 失败")
+
+    log(f"[*] 成功获取 User Code: {user_code}")
+    log(f"[*] 导航访问授权页面: {complete_url}")
+
+    run("open", complete_url, "--window", "foreground", timeout=30)
+    wait_doc_loaded(timeout=10)
+    log("[*] 等待授权页面 UI 渲染完成 (停留 3.5 秒)...")
+    time.sleep(3.5)
+
+    deadline = time.time() + timeout
+    token_result = {}
+
+    # 启动后台线程轮询
+    import threading
+    def _poll_bg():
+        nonlocal token_result
+        token_result = poll_device_token(
+            device_code,
+            interval=interval,
+            timeout=timeout,
+            token_endpoint=token_ep,
+            log=log
+        )
+
+    t = threading.Thread(target=_poll_bg, daemon=True)
+    t.start()
+
+    log("[*] 3. 执行多阶段 JS 自动化与 Form Submit DOM 兜底...")
+    while time.time() < deadline:
+        if token_result.get("access_token"):
+            log("[*] 后台已成功捕获 Access Token！")
+            break
+
+        # 通过增强版 JS 脚本寻找按钮并结合 CDP 原生点击处理两阶段交互
+        res = eval_js(f"""(() => {{
+            const text = document.body ? document.body.innerText : '';
+            const url = window.location.href;
+
+            const ensureId = (el) => {{
+                if (!el.id) el.id = '__grok_auth_btn_' + Date.now();
+                return el.id;
+            }};
+
+            // 阶段 1：设备确认页 (存在 input[name=user_code] 且非 consent 路由)
+            const codeInput = document.querySelector('input[name=user_code]');
+            if (codeInput && !url.includes('/consent')) {{
+                if (!codeInput.value) {{
+                    codeInput.value = '{user_code}';
+                    codeInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                }}
+                const buttons = Array.from(document.querySelectorAll('button, input[type=submit]'));
+                const nextBtn = buttons.find(b => {{
+                    const t = (b.innerText || b.value || '').trim();
+                    return t === '继续' || t === 'Continue' || t === 'Next' || t === '确认';
+                }}) || document.querySelector('button[type=submit]');
+                if (nextBtn) {{
+                    return 'found_device_next:' + ensureId(nextBtn);
+                }}
+            }}
+
+            // 阶段 2：授权 consent 页 + Form Submit DOM 兜底
+            if (url.includes('/consent') || text.includes('授权 Grok Build') || text.includes('Authorize Grok Build') || text.includes('Grok Build')) {{
+                const buttons = Array.from(document.querySelectorAll('button, a, input[type=submit]'));
+                const allowBtn = buttons.find(b => {{
+                    const t = (b.innerText || b.value || '').trim();
+                    return t === '允许' || t === 'Allow' || t === 'Authorize' || t === 'Approve';
+                }});
+                if (allowBtn) {{
+                    return 'found_allow:' + ensureId(allowBtn);
+                }}
+
+                // DOM 提交兜底：找不到允许按钮或点击未触发跳转时，强制向 Form 插入 action=allow 并 submit
+                const form = document.querySelector('form');
+                if (form) {{
+                    let actionInput = form.querySelector('input[name=action]');
+                    if (!actionInput) {{
+                        actionInput = document.createElement('input');
+                        actionInput.type = 'hidden';
+                        actionInput.name = 'action';
+                        form.appendChild(actionInput);
+                    }}
+                    actionInput.value = 'allow';
+                    form.submit();
+                    return 'submitted_form_fallback';
+                }}
+            }}
+            return 'waiting';
+        }})()""")
+
+        res_str = str(res)
+        if res_str.startswith("found_allow:"):
+            btn_id = res_str.split(":", 1)[1]
+            log(f"[*] 找到授权允许按钮(id={btn_id})，执行原生 CDP 点击...")
+            try:
+                run("click", f"#{btn_id}", timeout=10)
+            except Exception as e:
+                log(f"[!] 原生点击失败: {e}")
+            time.sleep(4.0)
+        elif res_str == "submitted_form_fallback":
+            log("[*] 触发 Form Submit DOM 兜底提交，等待页面刷新响应...")
+            time.sleep(4.0)
+        elif res_str.startswith("found_device_next:"):
+            btn_id = res_str.split(":", 1)[1]
+            log(f"[*] 找到设备确认【继续】按钮(id={btn_id})，执行原生 CDP 点击...")
+            try:
+                run("click", f"#{btn_id}", timeout=10)
+            except Exception as e:
+                log(f"[!] 原生点击失败: {e}")
+            time.sleep(2.5)
+        else:
+            time.sleep(1.5)
+
+    t.join(timeout=2)
+    if token_result.get("access_token"):
+        # 自动写出标准 CPA xAI JSON 文件并落地
+        save_cpa_json_credential(
+            token_result,
+            token_endpoint=token_ep,
+            auth_dir="cpa_auths",
+            log=log
+        )
+        return token_result.get("access_token")
+
+    raise Exception("等待超时：授权 Grok Build 失败")
 
 
 # ─── NSFW 开启 (HTTP) ───────────────────────────────────────────────────────────
@@ -1903,16 +2211,19 @@ def register_one_account(log=print, enable_nsfw=True, provider=None):
     profile = fill_profile_and_submit(log=log)
     log(f"[*] 资料: {profile['given_name']} {profile['family_name']}")
 
-    log("[*] 5. 等待 sso cookie")
-    sso = wait_for_sso(log=log)
-    log(f"[*] sso 长度: {len(sso)}")
+    log("[*] 5. 授权 Grok Build")
+    token = authorize_grok_build(log=log)
+    log(f"[*] 授权成功, Access Token 长度: {len(token)}")
 
     if enable_nsfw:
         log("[*] 6. 开启 NSFW")
-        ok, msg = enable_nsfw_for_token(sso, log=log)
-        log(f"[{'+'if ok else '!'}] NSFW: {msg}")
+        try:
+            ok, msg = enable_nsfw_for_token(token, log=log)
+            log(f"[{'+' if ok else '!'}] NSFW: {msg}")
+        except Exception as e:
+            log(f"[!] 开启 NSFW 出现异常: {e}")
 
-    return email, profile["password"], sso
+    return email, profile["password"], token
 
 
 def run_batch(count, log=print, enable_nsfw=True, provider=None, output_path=None):
