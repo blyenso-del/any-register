@@ -1632,7 +1632,7 @@ return '';
     try:
         env = _opencli_env()
         r = subprocess.run(
-            [*OPENCLI, "browser", "grok_register", "cookies", "--url", "https://grok.com"],
+            [*OPENCLI, "browser", SESSION, "cookies", "--url", "https://grok.com"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, env=env,
         )
         out = r.stdout or ""
@@ -1829,7 +1829,10 @@ def poll_device_token(device_code: str, interval: int = 5, timeout: int = 120, t
                     continue
                 elif err in ("expired_token", "access_denied"):
                     log(f"[!] 设备码已失效或拒绝授权: {err}")
-                    return {}
+                    return {"error": err}
+                elif err == "invalid_grant":
+                    log(f"[!] 无效的授权(invalid_grant): {err_body}")
+                    return {"error": "invalid_grant", "details": err_body}
             except Exception:
                 pass
             time.sleep(curr_interval)
@@ -1926,7 +1929,7 @@ def save_cpa_json_credential(token_result: dict, token_endpoint: str = None, aut
         return ""
 
 
-def authorize_grok_build(log=print, timeout=120) -> str:
+def authorize_grok_build(email: str, password: str, log=print, timeout=120) -> str:
     log("[*] 1. 动态获取 OIDC Endpoint 配置...")
     endpoints = discover_oidc_endpoints(log=log)
     device_ep = endpoints.get("device_authorization_endpoint")
@@ -1990,8 +1993,6 @@ def authorize_grok_build(log=print, timeout=120) -> str:
 
     run("open", complete_url, "--window", "foreground", timeout=30)
     wait_doc_loaded(timeout=10)
-    log("[*] 等待授权页面 UI 渲染完成 (停留 3.5 秒)...")
-    time.sleep(3.5)
 
     deadline = time.time() + timeout
     token_result = {}
@@ -2016,8 +2017,10 @@ def authorize_grok_build(log=print, timeout=120) -> str:
         if token_result.get("access_token"):
             log("[*] 后台已成功捕获 Access Token！")
             break
+        if token_result.get("error"):
+            raise Exception(f"设备授权失败: {token_result['error']}")
 
-        # 通过增强版 JS 脚本寻找按钮并结合 CDP 原生点击处理两阶段交互
+        # 通过增强版 JS 脚本寻找按钮并结合 CDP 原生点击处理多阶段交互与加速检测
         res = eval_js(f"""(() => {{
             const text = document.body ? document.body.innerText : '';
             const url = window.location.href;
@@ -2026,6 +2029,71 @@ def authorize_grok_build(log=print, timeout=120) -> str:
                 if (!el.id) el.id = '__grok_auth_btn_' + Date.now();
                 return el.id;
             }};
+
+            // 阶段 3：已授权完成加速检测并使用 Chromium 代取 Token
+            if (url.includes('/device/done') || text.includes('设备已授权') || text.includes('Device Authorized') || text.includes('成功连接')) {{
+                try {{
+                    const req = new XMLHttpRequest();
+                    req.open('POST', '{token_ep}', false);
+                    req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                    req.setRequestHeader('Accept', 'application/json');
+                    req.send('grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=b1a00492-073a-47ea-816f-4c329264a828&device_code={device_code}');
+                    if (req.status === 200 && req.responseText) {{
+                        return 'chromium_token:' + req.responseText;
+                    }}
+                }} catch (e) {{
+                    return 'authorized_done';
+                }}
+                return 'authorized_done';
+            }}
+
+            // 阶段 4：设备确认由于未登录跳到重新登录页面
+            if (url.includes('/sign-in') || url.includes('login')) {{
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const emailBtn = buttons.find(b => {{
+                    const t = (b.innerText || '').trim();
+                    return t === '使用邮箱登录' || t.includes('Continue with email') || t.includes('Sign in with email');
+                }});
+                if (emailBtn) {{
+                    return 'found_signin_email_btn:' + ensureId(emailBtn);
+                }}
+                
+                const emailInput = document.querySelector('input[type="email"], input[name="email"]');
+                const passwordInput = document.querySelector('input[type="password"], input[name="password"]');
+                
+                if (emailInput && !passwordInput) {{
+                    if (!emailInput.value) {{
+                        emailInput.value = '{email}';
+                        emailInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }}
+                    const nextBtn = buttons.find(b => {{
+                        const t = (b.innerText || '').trim();
+                        return t === '下一步' || t === 'Next' || t === 'Continue' || t === '继续';
+                    }});
+                    if (nextBtn) {{
+                        return 'found_signin_next_btn:' + ensureId(nextBtn);
+                    }}
+                }}
+                
+                if (emailInput && passwordInput) {{
+                    if (!emailInput.value) {{
+                        emailInput.value = '{email}';
+                        emailInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }}
+                    if (!passwordInput.value) {{
+                        passwordInput.value = '{password}';
+                        passwordInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }}
+                    const loginBtn = buttons.find(b => {{
+                        const t = (b.innerText || '').trim();
+                        return t === '登录' || t === 'Sign in' || t === 'Log in';
+                    }});
+                    if (loginBtn) {{
+                        return 'found_signin_login_btn:' + ensureId(loginBtn);
+                    }}
+                }}
+                return 'waiting_signin';
+            }}
 
             // 阶段 1：设备确认页 (存在 input[name=user_code] 且非 consent 路由)
             const codeInput = document.querySelector('input[name=user_code]');
@@ -2044,7 +2112,7 @@ def authorize_grok_build(log=print, timeout=120) -> str:
                 }}
             }}
 
-            // 阶段 2：授权 consent 页 + Form Submit DOM 兜底
+            // 阶段 2：授权 consent页 + Form Submit DOM 兜底
             if (url.includes('/consent') || text.includes('授权 Grok Build') || text.includes('Authorize Grok Build') || text.includes('Grok Build')) {{
                 const buttons = Array.from(document.querySelectorAll('button, a, input[type=submit]'));
                 const allowBtn = buttons.find(b => {{
@@ -2074,7 +2142,46 @@ def authorize_grok_build(log=print, timeout=120) -> str:
         }})()""")
 
         res_str = str(res)
-        if res_str.startswith("found_allow:"):
+        if res_str.startswith("chromium_token:"):
+            json_str = res_str.split(":", 1)[1]
+            try:
+                import json
+                token_result = json.loads(json_str)
+                log("[*] Chromium 已成功代取并返回 Access Token！")
+                break
+            except Exception as e:
+                log(f"[!] Chromium 代取 Token 解析失败: {e}")
+        elif res_str == "authorized_done":
+            log("[*] 前端已确认【设备已授权】，加速轮询感知...")
+            if token_result.get("access_token") or token_result.get("error"):
+                break
+            # 如果等了太久还没有轮询到，强制结束防止死循环
+            if time.time() > deadline - 5:
+                break
+            time.sleep(1.0)
+        elif res_str.startswith("found_signin_email_btn:"):
+            btn_id = res_str.split(":", 1)[1]
+            log(f"[*] 页面重定向至登录，找到【使用邮箱登录】按钮，执行原生点击...")
+            try: run("click", f"#{btn_id}", timeout=5)
+            except Exception as e: log(f"[!] 原生点击失败: {e}")
+            time.sleep(2.0)
+        elif res_str.startswith("found_signin_next_btn:"):
+            btn_id = res_str.split(":", 1)[1]
+            log(f"[*] 找到【下一步】按钮，执行原生点击...")
+            try: run("click", f"#{btn_id}", timeout=5)
+            except Exception as e: log(f"[!] 原生点击失败: {e}")
+            time.sleep(2.0)
+        elif res_str.startswith("found_signin_login_btn:"):
+            btn_id = res_str.split(":", 1)[1]
+            log(f"[*] 找到【登录】按钮，执行原生点击并加持 Cloudflare 人机验证...")
+            try: run("click", f"#{btn_id}", timeout=5)
+            except Exception as e: log(f"[!] 原生点击失败: {e}")
+            time.sleep(1.5)
+            log("[*] 主动触发 Turnstile (CDP 原生点击复选框)...")
+            try: run("click", "#__cf_click_anchor", timeout=5)
+            except Exception: pass
+            time.sleep(4.0)
+        elif res_str.startswith("found_allow:"):
             btn_id = res_str.split(":", 1)[1]
             log(f"[*] 找到授权允许按钮(id={btn_id})，执行原生 CDP 点击...")
             try:
@@ -2236,7 +2343,7 @@ def register_one_account(log=print, enable_nsfw=True, provider=None):
     log(f"[*] 资料: {profile['given_name']} {profile['family_name']}")
 
     log("[*] 5. 授权 Grok Build")
-    token = authorize_grok_build(log=log)
+    token = authorize_grok_build(email=email, password=profile["password"], log=log)
     log(f"[*] 授权成功, Access Token 长度: {len(token)}")
 
     if enable_nsfw:
