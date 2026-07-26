@@ -2027,18 +2027,19 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
                         if time.time() - login_clicked_time > 5:
                             login_btn = tab.ele('text:登录', timeout=0.5) or tab.ele('text:Sign in', timeout=0.5) or tab.ele('text:Log in', timeout=0.5)
                             if login_btn and login_btn.states.is_displayed:
+                                log("[*] 尝试主动触发 Turnstile (点击复选框)...")
+                                try:
+                                    cf_box = tab.ele('css:#__cf_click_anchor', timeout=1.5)
+                                    if cf_box:
+                                        cf_box.click()
+                                        time.sleep(2.0)
+                                except:
+                                    pass
+
                                 log("[*] 找到【登录】按钮，执行点击...")
                                 login_btn.click()
                                 login_clicked_time = time.time()
                                 time.sleep(1.5)
-                                
-                                log("[*] 尝试主动触发 Turnstile (点击复选框)...")
-                                try:
-                                    cf_box = tab.ele('css:#__cf_click_anchor', timeout=2)
-                                    if cf_box:
-                                        cf_box.click()
-                                except:
-                                    pass
                         time.sleep(2.0)
                         continue
 
