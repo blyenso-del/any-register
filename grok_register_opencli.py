@@ -1935,7 +1935,7 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
         from DrissionPage import ChromiumOptions, Chromium
     except ImportError:
         log("[!] 未安装 DrissionPage，请先 pip install DrissionPage")
-        return
+        return None
 
     try:
         co = ChromiumOptions()
@@ -1951,11 +1951,24 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
         deadline = time.time() + timeout
         log("[*] 寻找【使用邮箱登录】按钮并自动完成登录...")
         
+        # 记录是否点击过登录，防止死循环点击
+        login_clicked_time = 0
+        
         while time.time() < deadline:
             try:
                 curr_url = tab.url
                 if "grok.com" in curr_url or ("/account" in curr_url and "sign-in" not in curr_url):
                     log(f"[*] 登录成功/已跳转: {curr_url}")
+                    # 尝试提取 SSO cookie 并返回
+                    sso_cookie = None
+                    for cookie in tab.cookies(as_dict=True).items():
+                        if cookie[0] in ('sso', 'sso-rw'):
+                            sso_cookie = cookie[1]
+                            break
+                    if sso_cookie:
+                        log(f"[*] 从独立 Chromium 成功提取到 SSO Cookie: {sso_cookie[:15]}...")
+                        browser.quit()
+                        return sso_cookie
                     break
             except Exception:
                 pass
@@ -1967,58 +1980,66 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
 
                 if email_input:
                     if not password_input:
-                        tab.run_js(f"""
-                            const input = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
-                            if (input && !input.value) {{
-                                const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')?.set;
-                                if (valueSetter) valueSetter.call(input, '{email}');
-                                else input.value = '{email}';
-                                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            }}
-                        """)
-                        time.sleep(0.5)
+                        if not email_input.value:
+                            email_input.clear()
+                            email_input.input(email)
+                            tab.run_js(f"""
+                                const input = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
+                                if (input) {{
+                                    input.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, data: '{email}', inputType: 'insertText' }}));
+                                    input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: '{email}', inputType: 'insertText' }}));
+                                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                }}
+                            """)
+                        
                         next_btn = tab.ele('text:下一步', timeout=0.5) or tab.ele('text:Next', timeout=0.5) or tab.ele('text:Continue', timeout=0.5) or tab.ele('text:继续', timeout=0.5)
-                        if next_btn:
+                        if next_btn and next_btn.states.is_displayed:
                             log("[*] 找到【下一步】按钮，执行点击...")
                             next_btn.click()
                             time.sleep(2.0)
                         continue
 
                     if password_input:
+                        if not email_input.value:
+                            email_input.clear()
+                            email_input.input(email)
+                        if not password_input.value:
+                            password_input.clear()
+                            password_input.input(password)
+                        
                         tab.run_js(f"""
                             const emailInput = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
-                            if (emailInput && !emailInput.value) {{
-                                const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(emailInput), 'value')?.set;
-                                if (valueSetter) valueSetter.call(emailInput, '{email}');
-                                else emailInput.value = '{email}';
-                                emailInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            if (emailInput) {{
+                                emailInput.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, data: '{email}', inputType: 'insertText' }}));
+                                emailInput.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: '{email}', inputType: 'insertText' }}));
                                 emailInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
                             }}
                             const pwdInput = document.querySelector('input[type="password"], input[name="password"]');
-                            if (pwdInput && !pwdInput.value) {{
-                                const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(pwdInput), 'value')?.set;
-                                if (valueSetter) valueSetter.call(pwdInput, '{password}');
-                                else pwdInput.value = '{password}';
-                                pwdInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            if (pwdInput) {{
+                                pwdInput.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, data: '{password}', inputType: 'insertText' }}));
+                                pwdInput.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: '{password}', inputType: 'insertText' }}));
                                 pwdInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
                             }}
                         """)
                         time.sleep(0.5)
-                        login_btn = tab.ele('text:登录', timeout=0.5) or tab.ele('text:Sign in', timeout=0.5) or tab.ele('text:Log in', timeout=0.5)
-                        if login_btn:
-                            log("[*] 找到【登录】按钮，执行点击...")
-                            login_btn.click()
-                            time.sleep(1.5)
-                            
-                            log("[*] 尝试主动触发 Turnstile (点击复选框)...")
-                            try:
-                                cf_box = tab.ele('css:#__cf_click_anchor', timeout=2)
-                                if cf_box:
-                                    cf_box.click()
-                            except:
-                                pass
-                            time.sleep(4.0)
+                        
+                        # 防止疯狂点击
+                        if time.time() - login_clicked_time > 5:
+                            login_btn = tab.ele('text:登录', timeout=0.5) or tab.ele('text:Sign in', timeout=0.5) or tab.ele('text:Log in', timeout=0.5)
+                            if login_btn and login_btn.states.is_displayed:
+                                log("[*] 找到【登录】按钮，执行点击...")
+                                login_btn.click()
+                                login_clicked_time = time.time()
+                                time.sleep(1.5)
+                                
+                                log("[*] 尝试主动触发 Turnstile (点击复选框)...")
+                                try:
+                                    cf_box = tab.ele('css:#__cf_click_anchor', timeout=2)
+                                    if cf_box:
+                                        cf_box.click()
+                                except:
+                                    pass
+                        time.sleep(2.0)
                         continue
 
                 # 阶段一：如果没有输入框，则查找选择邮箱登录的按钮
@@ -2036,6 +2057,7 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
 
         log("[*] Chromium 自动化流程结束，正在关闭浏览器...")
         browser.quit()
+        return None
 
     except Exception as e:
         log(f"[!] Chromium 自动化异常: {e}")
@@ -2043,6 +2065,7 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
             browser.quit()
         except:
             pass
+        return None
 
 
 def authorize_grok_build(email: str, password: str, log=print, timeout=120) -> str:
