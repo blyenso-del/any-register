@@ -1943,13 +1943,37 @@ def authorize_grok_build(log=print, timeout=120) -> str:
     else:
         log("[!] 提示：未在 30 秒内检测到跳转至 grok.com，直接尝试授权导航...")
 
-    log("[*] 2. 授权前导航访问 post-inject session URL: https://accounts.x.ai/account...")
+    log("[*] 2. 授权前准备：提取 sso Cookie 并跨域注入...")
+    sso_val = _try_document_cookie_sso()
+    if not sso_val:
+        log("[!] 未能在当前环境提取到 sso，请确保浏览器已登录！")
+    else:
+        log(f"[*] 成功提取 sso: {sso_val[:15]}...")
+
     try:
         run("open", "https://accounts.x.ai/account", "--window", "foreground", timeout=30)
         wait_doc_loaded(timeout=10)
+        
+        if sso_val:
+            log("[*] 正在向 accounts.x.ai 注入跨域 Session Cookie...")
+            inject_js = f"""(() => {{
+                document.cookie = "sso={sso_val}; domain=.x.ai; path=/; secure; samesite=none";
+                document.cookie = "sso-rw={sso_val}; domain=.x.ai; path=/; secure; samesite=none";
+                document.cookie = "sso={sso_val}; domain=accounts.x.ai; path=/; secure; samesite=none";
+                document.cookie = "sso-rw={sso_val}; domain=accounts.x.ai; path=/; secure; samesite=none";
+                document.cookie = "sso={sso_val}; domain=auth.x.ai; path=/; secure; samesite=none";
+                document.cookie = "sso-rw={sso_val}; domain=auth.x.ai; path=/; secure; samesite=none";
+                return 'ok';
+            }})()"""
+            eval_js(inject_js)
+            log("[*] Cookie 注入完成，刷新页面以同步会话状态...")
+            time.sleep(1.0)
+            run("open", "https://accounts.x.ai/account", "--window", "foreground", timeout=30)
+            wait_doc_loaded(timeout=10)
+            
         time.sleep(3.0)
     except Exception as e:
-        log(f"[!] 导航至 accounts.x.ai/account 出现提示/警告: {e}")
+        log(f"[!] 导航至 accounts.x.ai 出现异常: {e}")
 
     log("[*] 3. 向 auth.x.ai 申请 Device Code...")
     dev_info = request_device_code(device_endpoint=device_ep)
