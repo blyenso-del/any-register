@@ -1953,6 +1953,8 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
         
         # 记录是否点击过登录，防止死循环点击
         login_clicked_time = 0
+        wait_cf_since = 0
+        last_cf_retry_at = 0
         
         while time.time() < deadline:
             try:
@@ -2022,25 +2024,113 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
                             }}
                         """)
                         time.sleep(0.5)
-                        
-                        # 防止疯狂点击
-                        if time.time() - login_clicked_time > 5:
-                            login_btn = tab.ele('text:登录', timeout=0.5) or tab.ele('text:Sign in', timeout=0.5) or tab.ele('text:Log in', timeout=0.5)
-                            if login_btn and login_btn.states.is_displayed:
-                                log("[*] 尝试主动触发 Turnstile (点击复选框)...")
-                                try:
-                                    cf_box = tab.ele('css:#__cf_click_anchor', timeout=1.5)
-                                    if cf_box:
-                                        cf_box.click()
-                                        time.sleep(2.0)
-                                except:
-                                    pass
 
-                                log("[*] 找到【登录】按钮，执行点击...")
-                                login_btn.click()
-                                login_clicked_time = time.time()
-                                time.sleep(1.5)
-                        time.sleep(2.0)
+                        submit_state = tab.run_js("""
+                            function attemptSubmit() {
+                                const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+                                let solvedByToken = false;
+                                if (cfInput) {
+                                    const val = cfInput.value || '';
+                                    if (val.length > 50) solvedByToken = true;
+                                }
+                                
+                                const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
+                                    return node.offsetParent !== null && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+                                });
+                                const submitBtn = buttons.find((node) => {
+                                    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
+                                    return t.includes('登录') || t.includes('signin') || t.includes('login') || t.includes('submit') || t.includes('next');
+                                });
+                                
+                                if (!submitBtn) {
+                                    return 'no-submit-button';
+                                }
+                                
+                                if (cfInput && !solvedByToken) {
+                                    submitBtn.click();
+                                    return 'wait-cloudflare:' + (cfInput.value || '').length;
+                                }
+                                
+                                submitBtn.focus();
+                                submitBtn.click();
+                                return 'submitted';
+                            }
+                            return attemptSubmit();
+                        """)
+                        
+                        now = time.time()
+                        if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
+                            token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
+                            log(f"[*] 已点击登录，等待跳转或人机验证... 当前token长度={token_len} (已等 {now - wait_cf_since:.1f}s)")
+                            if wait_cf_since == 0:
+                                wait_cf_since = now
+                                
+                            if now - wait_cf_since >= 8 and now - last_cf_retry_at >= 6:
+                                log("[*] 登录卡住，自动调用 Turnstile Token 并注入...")
+                                try:
+                                    cf_token = ""
+                                    tab.run_js("(()=>{ try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {} return 'ok'; })()")
+                                    for _ in range(10):
+                                        token = tab.run_js(r"""(()=>{
+                                            try {
+                                                const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
+                                                if (byInput && byInput.length > 50) return byInput;
+                                                if (window.turnstile && typeof turnstile.getResponse === 'function')
+                                                    return String(turnstile.getResponse() || '').trim();
+                                                return '';
+                                            } catch(e) { return ''; }
+                                        })()""")
+                                        if token and len(token) >= 50:
+                                            cf_token = token
+                                            break
+                                        
+                                        wrapper = tab.ele('css:iframe[src*="turnstile"]', timeout=0.1) or tab.ele('.cf-turnstile', timeout=0.1) or tab.ele('#turnstile-widget', timeout=0.1)
+                                        if not wrapper:
+                                            cf_input = tab.ele('css:input[name="cf-turnstile-response"]', timeout=0.1)
+                                            if cf_input:
+                                                wrapper = cf_input.parent(2)
+                                                
+                                        if wrapper:
+                                            try:
+                                                rect = wrapper.rect.location
+                                                size = wrapper.rect.size
+                                                click_x = rect[0] + 30
+                                                click_y = rect[1] + size[1] / 2
+                                                tab.run_cdp('Input.dispatchMouseEvent', type='mousePressed', x=click_x, y=click_y, button='left', clickCount=1)
+                                                time.sleep(0.05)
+                                                tab.run_cdp('Input.dispatchMouseEvent', type='mouseReleased', x=click_x, y=click_y, button='left', clickCount=1)
+                                            except Exception:
+                                                pass
+                                        time.sleep(1.0)
+                                    if cf_token:
+                                        synced = tab.run_js(f"""
+                                            const token = '{cf_token}';
+                                            const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+                                            if (!cfInput || !token) return false;
+                                            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                                            if (nativeSetter) nativeSetter.call(cfInput, token);
+                                            else cfInput.value = token;
+                                            cfInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                            cfInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                            return String(cfInput.value || '').trim().length;
+                                        """)
+                                        log(f"[*] Turnstile 二次复用完成，回填长度={synced}")
+                                        
+                                        # 注入完成后重置等待计时器，让它下一轮立刻重新提交
+                                        wait_cf_since = 0
+                                except Exception as cf_exc:
+                                    log(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
+                                last_cf_retry_at = time.time()
+                        elif submit_state == "submitted":
+                            if login_clicked_time == 0 or now - login_clicked_time > 8:
+                                log("[*] 执行登录表单提交...")
+                                login_clicked_time = now
+                                wait_cf_since = 0
+                        else:
+                            # no-submit-button
+                            pass
+                        
+                        time.sleep(1.5)
                         continue
 
                 # 阶段一：如果没有输入框，则查找选择邮箱登录的按钮
