@@ -1961,71 +1961,72 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
                 pass
 
             try:
-                # 阶段一：选择邮箱登录
-                email_btn = tab.ele('text:使用邮箱登录', timeout=0.5) or tab.ele('text:Continue with email', timeout=0.5) or tab.ele('text:Sign in with email', timeout=0.5)
-                if email_btn:
-                    log("[*] 找到【使用邮箱登录】按钮，执行点击...")
-                    email_btn.click()
-                    time.sleep(2.0)
-                    continue
-
-                # 阶段二/三：查找输入框
+                # 阶段二/三：优先查找输入框
                 email_input = tab.ele('css:input[type="email"], input[name="email"], input[autocomplete="email"]', timeout=0.5)
                 password_input = tab.ele('css:input[type="password"], input[name="password"]', timeout=0.5)
 
-                if email_input and not password_input:
-                    tab.run_js(f"""
-                        const input = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
-                        if (input && !input.value) {{
-                            const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')?.set;
-                            if (valueSetter) valueSetter.call(input, '{email}');
-                            else input.value = '{email}';
-                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        }}
-                    """)
-                    time.sleep(0.5)
-                    next_btn = tab.ele('text:下一步', timeout=0.5) or tab.ele('text:Next', timeout=0.5) or tab.ele('text:Continue', timeout=0.5) or tab.ele('text:继续', timeout=0.5)
-                    if next_btn:
-                        log("[*] 找到【下一步】按钮，执行点击...")
-                        next_btn.click()
-                        time.sleep(2.0)
-                    continue
+                if email_input:
+                    if not password_input:
+                        tab.run_js(f"""
+                            const input = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
+                            if (input && !input.value) {{
+                                const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')?.set;
+                                if (valueSetter) valueSetter.call(input, '{email}');
+                                else input.value = '{email}';
+                                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            }}
+                        """)
+                        time.sleep(0.5)
+                        next_btn = tab.ele('text:下一步', timeout=0.5) or tab.ele('text:Next', timeout=0.5) or tab.ele('text:Continue', timeout=0.5) or tab.ele('text:继续', timeout=0.5)
+                        if next_btn:
+                            log("[*] 找到【下一步】按钮，执行点击...")
+                            next_btn.click()
+                            time.sleep(2.0)
+                        continue
 
-                if email_input and password_input:
-                    tab.run_js(f"""
-                        const emailInput = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
-                        if (emailInput && !emailInput.value) {{
-                            const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(emailInput), 'value')?.set;
-                            if (valueSetter) valueSetter.call(emailInput, '{email}');
-                            else emailInput.value = '{email}';
-                            emailInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            emailInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        }}
-                        const pwdInput = document.querySelector('input[type="password"], input[name="password"]');
-                        if (pwdInput && !pwdInput.value) {{
-                            const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(pwdInput), 'value')?.set;
-                            if (valueSetter) valueSetter.call(pwdInput, '{password}');
-                            else pwdInput.value = '{password}';
-                            pwdInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            pwdInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        }}
-                    """)
-                    time.sleep(0.5)
-                    login_btn = tab.ele('text:登录', timeout=0.5) or tab.ele('text:Sign in', timeout=0.5) or tab.ele('text:Log in', timeout=0.5)
-                    if login_btn:
-                        log("[*] 找到【登录】按钮，执行点击...")
-                        login_btn.click()
-                        time.sleep(1.5)
-                        
-                        log("[*] 尝试主动触发 Turnstile (点击复选框)...")
-                        try:
-                            cf_box = tab.ele('css:#__cf_click_anchor', timeout=2)
-                            if cf_box:
-                                cf_box.click()
-                        except:
-                            pass
-                        time.sleep(4.0)
+                    if password_input:
+                        tab.run_js(f"""
+                            const emailInput = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
+                            if (emailInput && !emailInput.value) {{
+                                const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(emailInput), 'value')?.set;
+                                if (valueSetter) valueSetter.call(emailInput, '{email}');
+                                else emailInput.value = '{email}';
+                                emailInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                emailInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            }}
+                            const pwdInput = document.querySelector('input[type="password"], input[name="password"]');
+                            if (pwdInput && !pwdInput.value) {{
+                                const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(pwdInput), 'value')?.set;
+                                if (valueSetter) valueSetter.call(pwdInput, '{password}');
+                                else pwdInput.value = '{password}';
+                                pwdInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                pwdInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            }}
+                        """)
+                        time.sleep(0.5)
+                        login_btn = tab.ele('text:登录', timeout=0.5) or tab.ele('text:Sign in', timeout=0.5) or tab.ele('text:Log in', timeout=0.5)
+                        if login_btn:
+                            log("[*] 找到【登录】按钮，执行点击...")
+                            login_btn.click()
+                            time.sleep(1.5)
+                            
+                            log("[*] 尝试主动触发 Turnstile (点击复选框)...")
+                            try:
+                                cf_box = tab.ele('css:#__cf_click_anchor', timeout=2)
+                                if cf_box:
+                                    cf_box.click()
+                            except:
+                                pass
+                            time.sleep(4.0)
+                        continue
+
+                # 阶段一：如果没有输入框，则查找选择邮箱登录的按钮
+                email_btn = tab.ele('text:使用邮箱登录', timeout=0.5) or tab.ele('text:Continue with email', timeout=0.5) or tab.ele('text:Sign in with email', timeout=0.5)
+                if email_btn and email_btn.states.is_displayed:
+                    log("[*] 找到【使用邮箱登录】按钮，执行点击...")
+                    email_btn.click()
+                    time.sleep(2.0)
                     continue
 
             except Exception as loop_e:
