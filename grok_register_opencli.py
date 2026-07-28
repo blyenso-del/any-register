@@ -65,6 +65,7 @@ DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 YYDS_API_BASE = "https://maliapi.215.im/v1"
 
 BRIDGE_RECOVER_RETRIES = 3
+CLIENT_ID="b1a00492-073a-47ea-816f-4c329264a828"
 
 # ─── opencli 基础设施 ───────────────────────────────────────────────────────────
 
@@ -1768,7 +1769,7 @@ def request_device_code(device_endpoint: str = None) -> dict:
     import json
     url = device_endpoint or "https://auth.x.ai/oauth2/device/code"
     payload = urllib.parse.urlencode({
-        "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+        "client_id": CLIENT_ID,
         "scope": "openid profile email offline_access grok-cli:access api:access",
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -1793,7 +1794,7 @@ def poll_device_token(device_code: str, interval: int = 5, timeout: int = 120, t
     payload = urllib.parse.urlencode({
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         "device_code": device_code.strip(),
-        "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+        "client_id": CLIENT_ID,
     }).encode("utf-8")
 
     curr_interval = interval
@@ -1963,14 +1964,20 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
                     log(f"[*] 登录成功/已跳转: {curr_url}")
                     # 尝试提取 SSO cookie 并返回
                     sso_cookie = None
-                    for cookie in tab.cookies(as_dict=True).items():
-                        if cookie[0] in ('sso', 'sso-rw'):
-                            sso_cookie = cookie[1]
+                    cookies_list = tab.cookies() or []
+                    for c in cookies_list:
+                        if isinstance(c, dict) and c.get('name') in ('sso', 'sso-rw'):
+                            sso_cookie = c.get('value')
                             break
                     if sso_cookie:
                         log(f"[*] 从独立 Chromium 成功提取到 SSO Cookie: {sso_cookie[:15]}...")
-                        browser.quit()
-                        return sso_cookie
+                        try:
+                            with open("extracted_cookies.txt", "a", encoding="utf-8") as f:
+                                f.write(f"{email}|{password}|{sso_cookie}\n")
+                            log("[+] 账号凭证已追加到 extracted_cookies.txt (格式: 邮箱|密码|cookie)")
+                        except Exception as e:
+                            log(f"[-] 导出账号Cookie失败: {e}")
+                        return sso_cookie, tab
                     break
             except Exception:
                 pass
@@ -2146,9 +2153,8 @@ def open_signin_and_login_with_email(email: str, password: str, log=print, timeo
                 
             time.sleep(1.5)
 
-        log("[*] Chromium 自动化流程结束，正在关闭浏览器...")
-        browser.quit()
-        return None
+        log("[*] Chromium 自动化流程结束")
+        return None, None
 
     except Exception as e:
         log(f"[!] Chromium 自动化异常: {e}")
@@ -2375,13 +2381,17 @@ def authorize_grok_build(email: str, password: str, log=print, timeout=120) -> s
             time.sleep(2.0)
             
             log("[*] 正在拉起chromium访问 sign-in 并验证...")
-            open_signin_and_login_with_email(email, password, log)
+            sso_res = open_signin_and_login_with_email(email, password, log)
+            sso_extracted = sso_res[0] if isinstance(sso_res, tuple) else sso_res
+            active_tab = sso_res[1] if isinstance(sso_res, tuple) and len(sso_res)>1 else None
             break
         elif res_str == "submitted_form_fallback":
             log("[*] 触发 Form Submit DOM 兜底提交，等待页面刷新响应...")
             time.sleep(2.0)
             log("[*] 正在拉起chromium访问 sign-in 并验证...")
-            open_signin_and_login_with_email(email, password, log)
+            sso_res = open_signin_and_login_with_email(email, password, log)
+            sso_extracted = sso_res[0] if isinstance(sso_res, tuple) else sso_res
+            active_tab = sso_res[1] if isinstance(sso_res, tuple) and len(sso_res)>1 else None
             break
         elif res_str.startswith("found_device_next:"):
             btn_id = res_str.split(":", 1)[1]
@@ -2407,6 +2417,32 @@ def authorize_grok_build(email: str, password: str, log=print, timeout=120) -> s
         )
         return token_result.get("access_token")
 
+    if sso_extracted:
+        log("[*] Device Code 授权失败，但已提取到 SSO，触发兜底 CPA Export 逻辑 (复用浏览器 Session)...")
+        try:
+            import sys
+            if r"E:\ai\grok-register" not in sys.path:
+                sys.path.append(r"E:\ai\grok-register")
+            from cpa_export import export_cpa_xai_for_account
+            page_to_use = active_tab if 'active_tab' in locals() and active_tab else None
+            res = export_cpa_xai_for_account(
+                email=email, password=password, sso=sso_extracted, page=page_to_use,
+                config={"cpa_export_enabled": True, "cpa_auth_dir": "cpa_auths", "cpa_force_standalone": False},
+                log_callback=log
+            )
+            log(f"[+] 兜底 CPA Export 结果: {res}")
+            if page_to_use and hasattr(page_to_use, 'browser'):
+                page_to_use.browser.quit()
+            if res.get('ok'):
+                log(f"[*] 兜底导出成功！保存路径为: {res.get('path')}")
+                return "fallback_sso_export_success"
+        except Exception as e:
+            log(f"[-] 兜底 CPA Export 执行失败: {e}")
+            if 'active_tab' in locals() and active_tab and hasattr(active_tab, 'browser'):
+                active_tab.browser.quit()
+
+    if 'active_tab' in locals() and active_tab and hasattr(active_tab, 'browser'):
+        active_tab.browser.quit()
     raise Exception("等待超时或授权失败：未能获取 Access Token")
 
 

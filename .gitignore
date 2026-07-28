@@ -28,3 +28,5 @@ cpa_auth_failed.txt
 
 *.pending.jsonl
 *.pending.jsonl.lock
+.tmp/
+.serena/
